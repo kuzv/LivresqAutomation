@@ -1,0 +1,501 @@
+#Requires AutoHotkey v2.0
+#SingleInstance Force
+SetTitleMatchMode(2)
+CoordMode "Mouse", "Screen"
+
+; === CONFIGURATION ===
+global WindowTitle := "Editor - LIVRESQ"
+global PagePositions := []
+global Livresq_hwnd := 0
+global CurrentBatch := 1
+global TotalPages := 0
+global ProgressText := ""
+global SelectionSpeed := 1  ; 1 = Normal, 2 = Fast
+global RenameSpeed := 1    ; 1 = Normal, 2 = Fast
+global ConfigFile := "LivresqConfig.ini"
+global LastPageNumber := 0
+global ScriptVersion := "1.8.4"
+
+; === COORDINATES ===
+global AddPage_X := 223, AddPage_Y := 236
+global FirstPage_X := 282, FirstPage_Y := 352
+global LastPage_X := 1663, LastPage_Y := 374
+global Col_Spacing := 182
+global Row_Spacing := 193
+
+LoadConfig()
+
+; ### Progress GUI Functions ###
+CreateProgressGui(message := "") {
+    global ProgressGui, ProgressText
+    DestroyProgressGui()
+    
+    ProgressGui := Gui("+AlwaysOnTop -Caption +ToolWindow")
+    ProgressGui.BackColor := "2D2D30"
+    ProgressGui.SetFont("s10 cF0F0F0", "Segoe UI")
+    ProgressGui.Add("Progress", "x0 y0 w400 h4 Background1F97FF")
+    
+    if (message = "")
+        message := "⚡ Paraschiv AI ⚡"
+    
+    ProgressText := ProgressGui.Add("Text", "x10 y14 w380 h50 Center", message "`nF2: Create | F3: Rename Start | F4: Rename Next | Esc: Reset")
+    ProgressGui.Show("x" (A_ScreenWidth//2 - 200) " y20 w400 h70 NoActivate")
+    
+    return ProgressText
+}
+
+UpdateProgress(currentNumber) {
+    global ProgressGui, ProgressText, TotalPages, CurrentBatch
+    
+    if (!IsSet(ProgressText) || !ProgressText || !ProgressGui)
+        return
+    
+    progressStr := "🔄 Page " currentNumber "/" TotalPages " • Batch " CurrentBatch-1 " • ✓ " Round((currentNumber/TotalPages)*100) "%"
+    if (Mod(currentNumber, 7) = 0)
+        progressStr .= "`n⚡ Processing..."
+    
+    ProgressText.Value := progressStr "`nF2: Create | F3: Rename Start | F4: Rename Next | Esc: Reset"
+}
+
+ShowStatusMessage(title, message) {
+    msgGui := Gui("+AlwaysOnTop -Caption +ToolWindow")
+    msgGui.BackColor := "2D2D30"
+    msgGui.SetFont("s10 cF0F0F0", "Segoe UI")
+    msgGui.Add("Progress", "x0 y0 w400 h4 Background1F97FF")
+    msgGui.SetFont("s12 cFFFFFF Bold", "Segoe UI")
+    msgGui.Add("Text", "x10 y14 w380 h30 Center", title)
+    msgGui.SetFont("s10 cF0F0F0", "Segoe UI")
+    msgGui.Add("Text", "x20 y50 w360 Center", message)
+    msgGui.SetFont("s10", "Segoe UI")
+    okButton := msgGui.Add("Button", "x150 y120 w100 h30", "OK")
+    okButton.OnEvent("Click", (*) => msgGui.Destroy())
+    msgGui.Show("w400 h160 x" (A_ScreenWidth//2 - 200) " y" (A_ScreenHeight//2 - 80))
+    WinWaitClose "ahk_id " msgGui.Hwnd
+}
+
+DestroyProgressGui() {
+    global ProgressGui, ProgressText
+    try {
+        if IsSet(ProgressGui)
+            ProgressGui.Destroy()
+        ProgressGui := ""
+        ProgressText := ""
+    }
+}
+
+; ### Calibration Functions ###
+CalibrateCoordinates() {
+    global AddPage_X, AddPage_Y, FirstPage_X, FirstPage_Y, LastPage_X, LastPage_Y
+    
+    ShowStatusMessage("📍 Calibration", "Click the 'Add Page' button.")
+    KeyWait "LButton", "D"
+    MouseGetPos &AddPage_X, &AddPage_Y
+    
+    ShowStatusMessage("📍 Calibration", "Click the first page in the first row (existing page).")
+    KeyWait "LButton", "D"
+    MouseGetPos &FirstPage_X, &FirstPage_Y
+    
+    ShowStatusMessage("📍 Calibration", "Click the last page in the first row.")
+    KeyWait "LButton", "D"
+    MouseGetPos &LastPage_X, &LastPage_Y
+    
+    SaveConfig()
+    ShowStatusMessage("✅ Calibration Complete", "Coordinates saved.")
+}
+
+SaveConfig() {
+    global ConfigFile, AddPage_X, AddPage_Y, FirstPage_X, FirstPage_Y, LastPage_X, LastPage_Y
+    IniWrite AddPage_X, ConfigFile, "Coordinates", "AddPage_X"
+    IniWrite AddPage_Y, ConfigFile, "Coordinates", "AddPage_Y"
+    IniWrite FirstPage_X, ConfigFile, "Coordinates", "FirstPage_X"
+    IniWrite FirstPage_Y, ConfigFile, "Coordinates", "FirstPage_Y"
+    IniWrite LastPage_X, ConfigFile, "Coordinates", "LastPage_X"
+    IniWrite LastPage_Y, ConfigFile, "Coordinates", "LastPage_Y"
+}
+
+LoadConfig() {
+    global ConfigFile, AddPage_X, AddPage_Y, FirstPage_X, FirstPage_Y, LastPage_X, LastPage_Y
+    if FileExist(ConfigFile) {
+        AddPage_X := IniRead(ConfigFile, "Coordinates", "AddPage_X", AddPage_X)
+        AddPage_Y := IniRead(ConfigFile, "Coordinates", "AddPage_Y", AddPage_Y)
+        FirstPage_X := IniRead(ConfigFile, "Coordinates", "FirstPage_X", FirstPage_X)
+        FirstPage_Y := IniRead(ConfigFile, "Coordinates", "FirstPage_Y", FirstPage_Y)
+        LastPage_X := IniRead(ConfigFile, "Coordinates", "LastPage_X", LastPage_X)
+        LastPage_Y := IniRead(ConfigFile, "Coordinates", "LastPage_Y", LastPage_Y)
+    }
+}
+
+; ### Core Functions ###
+BulkAddPages(NumberOfPages) {
+    global Livresq_hwnd, FirstPage_X, FirstPage_Y, LastPage_X, LastPage_Y, SelectionSpeed
+    
+    sleepBeforeClick := (SelectionSpeed = 1) ? 50 : 25
+    sleepAfterFirstPageClick := (SelectionSpeed = 1) ? 200 : 150
+    sleepAfterClick := (SelectionSpeed = 1) ? 200 : 150
+    sleepAfterPaste := (SelectionSpeed = 1) ? [500, 300] : [400, 250]
+    sleepAfterShiftClick := (SelectionSpeed = 1) ? 1000 : 800
+    sleepAfterCopy := (SelectionSpeed = 1) ? 800 : 600
+    sleepAfterFirstRow := (SelectionSpeed = 1) ? 2000 : 1500
+    
+    progressText := CreateProgressGui("⚙️ Creating Pages...")
+    
+    if !Livresq_hwnd := WinExist(WindowTitle) {
+        DestroyProgressGui()
+        ShowStatusMessage("⚠️ Warning", "Livresq window not found.`nPlease open Livresq editor first.")
+        return 0
+    }
+    
+    try {
+        WinActivate "ahk_id " Livresq_hwnd
+        if !WinWaitActive("ahk_id " Livresq_hwnd,, 3) {
+            DestroyProgressGui()
+            ShowStatusMessage("⏱️ Timeout", "Could not activate Livresq window.")
+            return 0
+        }
+
+        progressText.Value := "📋 Creating first row from existing page..."
+        RetryClick(FirstPage_X, FirstPage_Y, sleepBeforeClick, 3)
+        Sleep sleepAfterFirstPageClick
+        Send "^c"
+        Sleep sleepAfterCopy
+        
+        firstRowPages := Min(NumberOfPages - 1, 8)
+        Loop firstRowPages {
+            Send "^v"
+            Sleep (A_Index = 1 ? sleepAfterPaste[1] : sleepAfterPaste[2])
+        }
+        Sleep sleepAfterFirstRow
+
+        remainingPages := NumberOfPages - (firstRowPages + 1)
+        if (remainingPages > 0) {
+            progressText.Value := "📋 Selecting first row for duplication..."
+            RetryClick(FirstPage_X, FirstPage_Y, sleepAfterFirstPageClick, 3)
+            Sleep sleepAfterClick
+            Send "{Shift down}"
+            RetryClick(LastPage_X, LastPage_Y, sleepBeforeClick, 3)
+            Send "{Shift up}"
+            Sleep sleepAfterShiftClick
+            Send "^c"
+            Sleep sleepAfterCopy
+
+            copyRounds := Ceil(remainingPages / 9)
+            Loop copyRounds {
+                progressText.Value := "🔄 Duplicating batch " A_Index "/" copyRounds "..."
+                Send "^v"
+                Sleep (A_Index = 1 ? sleepAfterPaste[1] : sleepAfterPaste[2])
+            }
+        }
+    }
+    catch as e {
+        DestroyProgressGui()
+        ShowStatusMessage("❌ Error", "Operation failed: " e.Message "`nPlease try again.")
+        return 0
+    }
+    
+    DestroyProgressGui()
+    return NumberOfPages
+}
+
+RetryClick(x, y, sleepTime, retries) {
+    Loop retries {
+        MouseMove x, y, 5
+        Sleep sleepTime
+        Click
+        Sleep 50
+        MouseGetPos &newX, &newY
+        if (Abs(newX - x) < 10 && Abs(newY - y) < 10)
+            return true
+        Sleep 200
+    }
+    ShowStatusMessage("⚠️ Click Failed", "Failed to click at (" x "," y ") after " retries " attempts.")
+    return false
+}
+
+RenameBatch(startNumber) {
+    global Livresq_hwnd, PageNamePrefix, SelectionSpeed, RenameSpeed, TotalPages, LastPageNumber
+    
+    tabDelay := (SelectionSpeed = 1) ? 100 : 25        ; Page Selection Speed
+    sleepAfterEnter := (RenameSpeed = 1) ? 1500 : 800  ; Renaming Speed
+    sleepAfterRename := (RenameSpeed = 1) ? 2000 : 1200 ; For stability
+    
+    CreateProgressGui()
+    
+    currentNumber := startNumber - 1
+    
+    if !Livresq_hwnd := WinExist(WindowTitle) {
+        DestroyProgressGui()
+        ShowStatusMessage("⚠️ Warning", "Livresq window not found.`nPlease open Livresq editor first.")
+        return
+    }
+    
+    try {
+        WinActivate "ahk_id " Livresq_hwnd
+        if !WinWaitActive("ahk_id " Livresq_hwnd,, 3) {
+            DestroyProgressGui()
+            ShowStatusMessage("⏱️ Timeout", "Could not activate Livresq window.")
+            return
+        }
+
+        ; Ensure focus on selected page
+        Sleep 500  ; Wait for page selection
+        Send "{Enter}"
+        Sleep sleepAfterEnter
+
+        while (currentNumber < TotalPages) {
+            currentNumber++
+            UpdateProgress(currentNumber)
+            
+            ; Tab to Rename Page button
+            Loop 5 {  ; Adjusted for Rename button
+                Send "{Tab}"
+                Sleep tabDelay
+            }
+            Send "{Enter}"
+            Sleep sleepAfterRename
+            
+            ; Rename page
+            Send PageNamePrefix " " currentNumber "{Enter}"
+            Sleep sleepAfterRename
+            
+            ; Go back to grid via Test Zone
+            Loop 3 {  ; Tab to Test Zone
+                Send "{Tab}"
+                Sleep tabDelay
+            }
+            Send "{Enter}"
+            Sleep sleepAfterEnter
+            Send "{Enter}"  ; Double Enter for safety
+            Sleep sleepAfterEnter
+            
+            if (currentNumber < TotalPages) {
+                ; Refocus grid with Tab 21
+                Loop 21 {
+                    Send "{Tab}"
+                    Sleep tabDelay
+                }
+                Sleep sleepAfterEnter
+                
+                ; Move to next page
+                Send "{Right}"
+                Sleep tabDelay
+            }
+            
+            LastPageNumber := currentNumber
+        }
+    }
+    catch as e {
+        DestroyProgressGui()
+        ShowStatusMessage("❌ Error", "Operation failed: " e.Message "`nPlease try again.")
+        return
+    }
+    
+    DestroyProgressGui()
+    ShowStatusMessage("🏆 All Complete", "All " TotalPages " pages renamed successfully!")
+}
+
+UpdateSelectionSpeed(*) {
+    global SelectionSpeed, selectionSlider, selectionText
+    SelectionSpeed := selectionSlider.Value
+    selectionText.Value := (SelectionSpeed = 1) ? "Page Selection: Normal" : "Page Selection: Fast"
+    selectionText.Opt("c" (SelectionSpeed = 1 ? "00FF00" : "FFFF00"))
+}
+
+UpdateRenameSpeed(*) {
+    global RenameSpeed, renameSlider, renameText
+    RenameSpeed := renameSlider.Value
+    renameText.Value := (RenameSpeed = 1) ? "Renaming: Normal" : "Renaming: Fast"
+    renameText.Opt("c" (RenameSpeed = 1 ? "00FF00" : "FFFF00"))
+}
+
+ShowStartupUI() {
+    global NumberOfPages, PageNamePrefix, StartNumber, SelectionSpeed, RenameSpeed, configGui, numberOfPagesEdit, pageNameEdit, startNumberEdit, selectionSlider, selectionText, renameSlider, renameText, createCheck, renameCheck, ScriptVersion
+    
+    NumberOfPages := 10
+    PageNamePrefix := "pag"
+    StartNumber := 1
+    SelectionSpeed := 1
+    RenameSpeed := 1
+    
+    configGui := Gui("+AlwaysOnTop +ToolWindow")
+    configGui.Title := "⚡ Paraschiv AI - LIVRESQ Automation v" ScriptVersion
+    configGui.BackColor := "2D2D30"
+    configGui.SetFont("s10 cF0F0F0", "Segoe UI")
+    configGui.Add("Progress", "x0 y0 w400 h4 Background1F97FF")
+    configGui.SetFont("s14 cFFFFFF Bold", "Segoe UI")
+    configGui.Add("Text", "x10 y10 w380 h30 Center", "⚡ LIVRESQ Page Creator ⚡")
+    configGui.SetFont("s10 cF0F0F0", "Segoe UI")
+    
+    configGui.Add("Text", "x20 y50 w180 h20", "Number of Pages:")
+    numberOfPagesEdit := configGui.Add("Edit", "x200 y50 w60 h20 Number", NumberOfPages)
+    configGui.Add("UpDown", "Range1-1000", NumberOfPages)
+    
+    configGui.Add("Text", "x20 y80 w180 h20", "Page Name Prefix:")
+    pageNameEdit := configGui.Add("Edit", "x200 y80 w60 h20", PageNamePrefix)
+    
+    configGui.Add("Text", "x20 y110 w180 h20", "Start Number:")
+    startNumberEdit := configGui.Add("Edit", "x200 y110 w60 h20 Number", StartNumber)
+    configGui.Add("UpDown", "Range1-1000", StartNumber)
+    
+    configGui.Add("Text", "x20 y140 w180 h20", "Page Selection Speed:")
+    selectionSlider := configGui.Add("Slider", "x200 y140 w150 h25 Range1-2 TickInterval1", SelectionSpeed)
+    selectionText := configGui.Add("Text", "x20 y170 w360 h20 c00FF00", "Page Selection: Normal")
+    
+    configGui.Add("Text", "x20 y200 w180 h20", "Renaming Speed:")
+    renameSlider := configGui.Add("Slider", "x200 y200 w150 h25 Range1-2 TickInterval1", RenameSpeed)
+    renameText := configGui.Add("Text", "x20 y230 w360 h20 c00FF00", "Renaming: Normal")
+    
+    configGui.Add("Text", "x20 y260 w180 h20", "Run Phases:")
+    createCheck := configGui.Add("Checkbox", "x20 y280 w180 h20 Checked", "Create Pages (F2)")
+    renameCheck := configGui.Add("Checkbox", "x20 y300 w180 h20 Checked", "Rename Pages (F3/F4)")
+    
+    configGui.Add("Button", "x20 y330 w100 h25", "Calibrate").OnEvent("Click", (*) => CalibrateCoordinates())
+    startButton := configGui.Add("Button", "x80 y360 w100 h25", "Start")
+    cancelButton := configGui.Add("Button", "x220 y360 w100 h25", "Exit")
+    
+    selectionSlider.OnEvent("Change", UpdateSelectionSpeed)
+    renameSlider.OnEvent("Change", UpdateRenameSpeed)
+    startButton.OnEvent("Click", StartButton_Click)
+    cancelButton.OnEvent("Click", CancelButton_Click)
+    configGui.OnEvent("Close", (*) => ExitApp)  ; X button fix
+    
+    configGui.Show("w400 h400 x" (A_ScreenWidth//2 - 200) " y" (A_ScreenHeight//2 - 200))
+    WinWaitClose "ahk_id " configGui.Hwnd
+}
+
+StartButton_Click(*) {
+    global NumberOfPages, PageNamePrefix, StartNumber, numberOfPagesEdit, pageNameEdit, startNumberEdit, configGui, LastPageNumber, createCheck, renameCheck, TotalPages
+    NumberOfPages := numberOfPagesEdit.Value
+    PageNamePrefix := pageNameEdit.Value
+    StartNumber := startNumberEdit.Value
+    LastPageNumber := StartNumber - 1
+    TotalPages := NumberOfPages
+    createEnabled := createCheck.Value
+    renameEnabled := renameCheck.Value
+    configGui.Hide()
+    RunScript(NumberOfPages, createEnabled, renameEnabled)
+}
+
+CancelButton_Click(*) {
+    ExitApp  ; Clean exit
+}
+
+RunScript(NumberOfPages, createEnabled, renameEnabled) {
+    global TotalPages, CurrentBatch
+
+    ShowStatusMessage("🎮 Controls", 
+        "F2: Create pages`nF3: Start renaming`nF4: Continue renaming`nESC: Reset")
+    
+    if (!createEnabled && !renameEnabled) {
+        ShowStatusMessage("⚠️ Warning", "No phases selected.`nPlease check at least one phase.")
+        return
+    }
+    
+    if (createEnabled && NumberOfPages > 0) {
+        TotalPages := BulkAddPages(NumberOfPages)
+        if (TotalPages > 0) {
+            CurrentBatch := 1
+            if (renameEnabled)
+                ShowStatusMessage("✅ Pages Created", "Created " TotalPages " pages.`nPress F3 to start renaming.")
+            else
+                ShowStatusMessage("✅ Pages Created", "Created " TotalPages " pages.`nRename not selected.")
+        }
+        else {
+            ShowStatusMessage("❌ Failed", "Page creation failed.`nCheck coordinates or restart Livresq.")
+            return
+        }
+    }
+    else if (renameEnabled) {
+        TotalPages := TotalPages
+        CurrentBatch := 1
+        ShowStatusMessage("ℹ️ Ready", "Rename phase enabled.`nTotal Pages: " TotalPages ". Select the page to start renaming from, then press OK.")
+    }
+}
+
+; ### Hotkeys ###
+F2:: {
+    global TotalPages, CurrentBatch, NumberOfPages, LastPageNumber, StartNumber, createCheck
+    
+    if (!IsSet(NumberOfPages)) {
+        ShowStatusMessage("⚠️ Warning", "Please use the startup UI to configure settings.")
+        return
+    }
+    
+    if (!createCheck.Value) {
+        ShowStatusMessage("ℹ️ Info", "Create Pages not enabled in UI.")
+        return
+    }
+    
+    TotalPages := BulkAddPages(NumberOfPages)
+    if (TotalPages > 0) {
+        CurrentBatch := 1
+        LastPageNumber := StartNumber - 1
+        ShowStatusMessage("✅ Success", "Created " TotalPages " pages successfully.`nPress F3 to start renaming.")
+    }
+    else {
+        ShowStatusMessage("❌ Failed", "Operation could not be completed.`nCheck coordinates or restart Livresq.")
+    }
+}
+
+F3:: {
+    global CurrentBatch, TotalPages, StartNumber, LastPageNumber, renameCheck
+    if (!renameCheck.Value) {
+        ShowStatusMessage("ℹ️ Info", "Rename Pages not enabled in UI.")
+        return
+    }
+    if (!TotalPages) {
+        ShowStatusMessage("⚠️ Warning", "No pages detected.`nPress F2 first to create pages or set Total Pages in UI.")
+        return
+    }
+    if (CurrentBatch != 1) {
+        ShowStatusMessage("ℹ️ Info", "Wrong sequence.`nUse F4 to continue with next batches.")
+        return
+    }
+    
+    RenameBatch(StartNumber)
+    CurrentBatch++
+}
+
+F4:: {
+    global CurrentBatch, TotalPages, StartNumber, LastPageNumber, renameCheck
+    DestroyProgressGui()
+    
+    if (!renameCheck.Value) {
+        ShowStatusMessage("ℹ️ Info", "Rename Pages not enabled in UI.")
+        return
+    }
+    if (!TotalPages) {
+        ShowStatusMessage("⚠️ Warning", "No pages detected.`nPress F2 first to create pages or set Total Pages in UI.")
+        return
+    }
+    if (CurrentBatch == 1) {
+        ShowStatusMessage("ℹ️ Info", "Wrong sequence.`nPress F3 to start the first batch.")
+        return
+    }
+    
+    if (TotalPages <= LastPageNumber) {
+        ShowStatusMessage("ℹ️ Info", "All " TotalPages " pages have been renamed.`nNo more pages to process.")
+        return
+    }
+    
+    RenameBatch(LastPageNumber + 1)
+    CurrentBatch++
+}
+
+#HotIf WinActive("ahk_id " Livresq_hwnd)
+~WheelDown:: {
+    MouseGetPos &mouseX, &mouseY
+    ToolTip "👀 Scrolling...", mouseX + 20, mouseY + 20
+    SetTimer () => ToolTip(), -1000
+}
+#HotIf
+
+Esc:: {
+    global CurrentBatch
+    DestroyProgressGui()
+    CurrentBatch := 1
+    ShowStatusMessage("⏹️ Stopped", "Actions stopped. Returning to UI.")
+    Sleep 500
+    ShowStartupUI()
+}
+
+ShowStartupUI()
